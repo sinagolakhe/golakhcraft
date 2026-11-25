@@ -1,0 +1,104 @@
+name: Windows MSI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-msi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    name: Windows x64 MSI
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out craft-fonts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: b076417b5880bd4154bd22f00695b1d28c6bea83
+          path: craft-fonts
+          persist-credentials: false
+
+      - name: Read craft-i18n.rev
+        id: craft_i18n
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath craft-i18n.rev -PathType Leaf)) {
+            throw 'craft-i18n.rev is missing'
+          }
+          $rev = (Get-Content -Raw -LiteralPath craft-i18n.rev).Trim()
+          if ($rev -notmatch '^[0-9a-f]{40}\z') {
+            throw "craft-i18n.rev must hold a 40-char SHA, got '$rev'"
+          }
+          "rev=$rev" >> $env:GITHUB_OUTPUT
+
+      - name: Check out craft-i18n
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-i18n
+          ref: ${{ steps.craft_i18n.outputs.rev }}
+          path: craft-i18n
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: step-security/dtolnay-rust-toolchain@8dd607977d06adf4ed49b190381e74c17a9dd25f # v1.0.0
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: windows-msi-x64
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tools = Join-Path $env:RUNNER_TEMP 'wix-tools'
+          dotnet tool install --tool-path $tools wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'WiX installation failed.' }
+          $tools >> $env:GITHUB_PATH
+          & (Join-Path $tools 'wix.exe') extension add -g 'WixToolset.UI.wixext/5.0.2' 'WixToolset.Util.wixext/5.0.2'
+          if ($LASTEXITCODE -ne 0) { throw 'WiX extension installation failed.' }
+
+      - name: Build and package Windows x64 MSI
+        shell: pwsh
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
+          CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
+          CRAFT_I18N_REQUIRED: "1"
+          PDFCRAFT_REQUIRE_WINRES: "1"
+          PDFCRAFT_BUILD_SHA: ${{ github.sha }}
+        run: ./packaging/windows/package.ps1 -Arch x64
+
+      - name: Upload Windows x64 MSI artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: golakhcraft-windows-x64
+          path: dist/release/*.msi
+          if-no-files-found: error

@@ -29,6 +29,11 @@ fn index(items: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 pub fn cff_font() -> Vec<u8> {
+    cff_font_with_names(&[(1, "Rect Font"), (2, "Regular"), (6, "RectFont-Regular"), (13, "MIT License")])
+}
+pub fn cff_font_with_names(names: &[(u16, &str)]) -> Vec<u8> {
+    let mut sorted = names.to_vec();
+    sorted.sort_by_key(|&(id, _)| id);
     let name = index(&[b"RectFont".to_vec()]);
     let mut dict = Vec::new();
     for n in [0, 0, 500, 700] {
@@ -88,13 +93,12 @@ pub fn cff_font() -> Vec<u8> {
         be32(&mut cmap, cp);
         be32(&mut cmap, gid);
     }
-    let names = [(1, "Rect Font"), (2, "Regular"), (6, "RectFont-Regular"), (13, "MIT License")];
     let mut name = Vec::new();
     be16(&mut name, 0);
-    be16(&mut name, names.len() as u16);
-    be16(&mut name, (6 + 12 * names.len()) as u16);
+    be16(&mut name, sorted.len() as u16);
+    be16(&mut name, (6 + 12 * sorted.len()) as u16);
     let mut data = Vec::new();
-    for (id, text) in names {
+    for (id, text) in sorted {
         let bytes: Vec<_> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
         for n in [3, 1, 0x409, id, bytes.len() as u16, data.len() as u16] {
             be16(&mut name, n);

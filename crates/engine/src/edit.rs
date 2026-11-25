@@ -535,7 +535,7 @@ pub enum Edit {
     PrepareText {
         page: usize,
     },
-    /// An explicit open-licensed full font program, completing subsets or selected by a user.
+    /// An explicit full font program, completing subsets or selected by a user.
     RegisterTextFont {
         page: usize,
         bytes: Arc<Vec<u8>>,

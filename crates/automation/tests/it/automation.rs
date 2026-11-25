@@ -811,6 +811,102 @@ fn explicit_font_and_disjoint_ranges_save_reopen_through_tools() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+fn replace_name_table(sfnt: &[u8], records: &[(u16, &str)]) -> Vec<u8> {
+    let mut sorted = records.to_vec();
+    sorted.sort_by_key(|&(id, _)| id);
+    let mut name = Vec::new();
+    name.extend_from_slice(&0u16.to_be_bytes());
+    name.extend_from_slice(&(sorted.len() as u16).to_be_bytes());
+    name.extend_from_slice(&((6 + 12 * sorted.len()) as u16).to_be_bytes());
+    let mut strings = Vec::new();
+    for (id, text) in sorted {
+        let encoded: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        for field in [3u16, 1, 0x0409, id, encoded.len() as u16, strings.len() as u16] {
+            name.extend_from_slice(&field.to_be_bytes());
+        }
+        strings.extend_from_slice(&encoded);
+    }
+    name.extend_from_slice(&strings);
+
+    let num_tables = u16::from_be_bytes([sfnt[4], sfnt[5]]) as usize;
+    let mut tables: Vec<([u8; 4], Vec<u8>)> = (0..num_tables)
+        .filter_map(|i| {
+            let rec = 12 + i * 16;
+            let tag: [u8; 4] = sfnt[rec..rec + 4].try_into().unwrap();
+            if &tag == b"name" {
+                return None;
+            }
+            let offset = u32::from_be_bytes(sfnt[rec + 8..rec + 12].try_into().unwrap()) as usize;
+            let len = u32::from_be_bytes(sfnt[rec + 12..rec + 16].try_into().unwrap()) as usize;
+            Some((tag, sfnt[offset..offset + len].to_vec()))
+        })
+        .collect();
+    tables.push((*b"name", name));
+    tables.sort_by_key(|(tag, _)| *tag);
+
+    let count = tables.len() as u16;
+    let selector = count.ilog2() as u16;
+    let search_range = (1u16 << selector) * 16;
+    let mut out = Vec::new();
+    out.extend_from_slice(&sfnt[0..4]);
+    out.extend_from_slice(&count.to_be_bytes());
+    out.extend_from_slice(&search_range.to_be_bytes());
+    out.extend_from_slice(&selector.to_be_bytes());
+    out.extend_from_slice(&(count * 16 - search_range).to_be_bytes());
+
+    let mut offset = 12 + 16 * tables.len();
+    let mut payload = Vec::new();
+    for (tag, bytes) in &tables {
+        let mut padded = bytes.clone();
+        padded.resize(padded.len().next_multiple_of(4), 0);
+        let sum = padded.as_chunks::<4>().0.iter().fold(0u32, |s, b| s.wrapping_add(u32::from_be_bytes(*b)));
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&sum.to_be_bytes());
+        out.extend_from_slice(&(offset as u32).to_be_bytes());
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        offset += padded.len();
+        payload.extend_from_slice(&padded);
+    }
+    out.extend_from_slice(&payload);
+    out
+}
+
+#[test]
+fn text_font_files_and_import_accept_unlicensed_and_proprietary_fonts() {
+    let dir = workdir("unlicensed-fonts");
+    let inter = include_bytes!("../../../../assets/fonts/Inter-Regular.ttf");
+    let unlicensed_bytes = replace_name_table(inter, &[(1, "Unlicensed Auto"), (2, "Regular"), (6, "UnlicensedAuto-Regular")]);
+    let proprietary_bytes = replace_name_table(
+        inter,
+        &[(0, "Copyright Adobe"), (1, "Prop Auto"), (2, "Regular"), (6, "PropAuto-Regular"), (8, "Adobe"), (13, "Proprietary License")],
+    );
+    std::fs::write(dir.join("unlicensed.ttf"), unlicensed_bytes).unwrap();
+    std::fs::write(dir.join("proprietary.ttf"), proprietary_bytes).unwrap();
+
+    let mut a = auto(&dir);
+    let found = ok(&mut a, "text_font_files", json!({}));
+    let faces: Vec<&str> = found["fonts"].as_array().unwrap().iter().filter_map(|f| f["font"].as_str()).collect();
+    assert!(faces.contains(&"UnlicensedAuto-Regular"), "{found}");
+    assert!(faces.contains(&"PropAuto-Regular"), "{found}");
+
+    let id = ok(&mut a, "doc_open", json!({"path":"a.pdf"}))["doc"].as_u64().unwrap();
+    let unlicensed = ok(&mut a, "text_font_import", json!({"doc":id,"page":1,"path":"unlicensed.ttf"}));
+    assert_eq!(unlicensed["font"], "UnlicensedAuto-Regular");
+    let resource = unlicensed["resource"].as_str().unwrap();
+    assert!(resource.starts_with("PCFull"), "{unlicensed}");
+
+    let proprietary = ok(&mut a, "text_font_import", json!({"doc":id,"page":1,"path":"proprietary.ttf"}));
+    assert_eq!(proprietary["font"], "PropAuto-Regular");
+
+    ok(&mut a, "text_edit", json!({"doc":id,"page":1,"paragraph":1,"text":"Aé Ω","font_resource":resource}));
+    ok(&mut a, "doc_save", json!({"doc":id,"path":"edited.pdf"}));
+    let reopened = ok(&mut a, "doc_open", json!({"path":"edited.pdf"}))["doc"].as_u64().unwrap();
+    assert_eq!(page_text(&mut a, reopened), ["Aé Ω", "Page 2", "Page 3"]);
+    let lines = ok(&mut a, "text_lines", json!({"doc":reopened,"page":1}));
+    assert!(lines["lines"].as_array().unwrap().iter().any(|l| l["text"].as_str().is_some_and(|s| s.contains("Aé"))), "{lines}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn added_arabic_text_keeps_copy_search_and_editor_order_after_retyping_and_reopen() {
     if pdfcraft_fonts::document_arabic_font().is_none() {

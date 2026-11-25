@@ -33,14 +33,14 @@ pub fn installed_directories() -> Vec<PathBuf> {
 }
 
 /// Bounded scan with resolved roots and no descendant symlinks.
-/// Only standalone, openly licensed, embeddable faces are listed.
+/// Only standalone, embeddable faces are listed.
 /// The caller controls roots (automation resolves confinement before calling this).
 pub fn discover(roots: &[PathBuf]) -> Vec<FontFile> {
     discover_budgeted(roots, 64u64 << 20)
 }
 
 /// Bounded scan with resolved roots and no descendant symlinks. `budget` caps the total
-/// size of the fonts listed: a rejected file (unreadable, not openly licensed, a duplicate)
+/// size of the fonts listed: a rejected file (unreadable, invalid/embedding-restricted, a duplicate)
 /// does not spend it. Every file read
 /// counts against four times the budget, so a folder of unusable fonts cannot stall the scan.
 pub fn discover_budgeted(roots: &[PathBuf], mut budget: u64) -> Vec<FontFile> {
@@ -254,5 +254,104 @@ mod tests {
         let capped = discover_budgeted(std::slice::from_ref(&root), reg_len + 10);
         let _ = std::fs::remove_dir_all(&root);
         assert!(capped.is_empty(), "the read allowance ends the scan before the real fonts");
+    }
+
+    fn replace_name_table(sfnt: &[u8], records: &[(u16, &str)]) -> Vec<u8> {
+        let mut sorted = records.to_vec();
+        sorted.sort_by_key(|&(id, _)| id);
+        let mut name = Vec::new();
+        name.extend_from_slice(&0u16.to_be_bytes());
+        name.extend_from_slice(&(sorted.len() as u16).to_be_bytes());
+        name.extend_from_slice(&((6 + 12 * sorted.len()) as u16).to_be_bytes());
+        let mut strings = Vec::new();
+        for (id, text) in sorted {
+            let encoded: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+            for field in [3u16, 1, 0x0409, id, encoded.len() as u16, strings.len() as u16] {
+                name.extend_from_slice(&field.to_be_bytes());
+            }
+            strings.extend_from_slice(&encoded);
+        }
+        name.extend_from_slice(&strings);
+
+        let num_tables = u16::from_be_bytes([sfnt[4], sfnt[5]]) as usize;
+        let mut tables: Vec<([u8; 4], Vec<u8>)> = (0..num_tables)
+            .filter_map(|i| {
+                let rec = 12 + i * 16;
+                let tag: [u8; 4] = sfnt[rec..rec + 4].try_into().unwrap();
+                if &tag == b"name" {
+                    return None;
+                }
+                let offset = u32::from_be_bytes(sfnt[rec + 8..rec + 12].try_into().unwrap()) as usize;
+                let len = u32::from_be_bytes(sfnt[rec + 12..rec + 16].try_into().unwrap()) as usize;
+                Some((tag, sfnt[offset..offset + len].to_vec()))
+            })
+            .collect();
+        tables.push((*b"name", name));
+        tables.sort_by_key(|(tag, _)| *tag);
+
+        let count = tables.len() as u16;
+        let selector = count.ilog2() as u16;
+        let search_range = (1u16 << selector) * 16;
+        let mut out = Vec::new();
+        out.extend_from_slice(&sfnt[0..4]);
+        out.extend_from_slice(&count.to_be_bytes());
+        out.extend_from_slice(&search_range.to_be_bytes());
+        out.extend_from_slice(&selector.to_be_bytes());
+        out.extend_from_slice(&(count * 16 - search_range).to_be_bytes());
+
+        let mut offset = 12 + 16 * tables.len();
+        let mut payload = Vec::new();
+        for (tag, bytes) in &tables {
+            let mut padded = bytes.clone();
+            padded.resize(padded.len().next_multiple_of(4), 0);
+            let sum = padded.as_chunks::<4>().0.iter().fold(0u32, |s, b| s.wrapping_add(u32::from_be_bytes(*b)));
+            out.extend_from_slice(tag);
+            out.extend_from_slice(&sum.to_be_bytes());
+            out.extend_from_slice(&(offset as u32).to_be_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            offset += padded.len();
+            payload.extend_from_slice(&padded);
+        }
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    #[test]
+    fn discover_lists_valid_fonts_without_license_or_with_proprietary_adobe_metadata() {
+        let root = std::env::temp_dir().join(format!("pdfcraft-font-unlicensed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts/Inter-Regular.ttf");
+        let inter = std::fs::read(source).unwrap();
+
+        std::fs::write(
+            root.join("unlicensed.ttf"),
+            replace_name_table(&inter, &[(1, "Unlicensed Face"), (2, "Regular"), (6, "UnlicensedFace-Regular")]),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("proprietary_adobe.ttf"),
+            replace_name_table(
+                &inter,
+                &[(0, "Copyright Adobe"), (1, "Prop Adobe"), (2, "Regular"), (6, "PropAdobe-Regular"), (8, "Adobe"), (13, "Proprietary License")],
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("source_han.otf"),
+            replace_name_table(&inter, &[(1, "Source Han Sans"), (2, "Regular"), (6, "SourceHanSans-Regular")]),
+        )
+        .unwrap();
+        std::fs::write(root.join("broken.ttf"), b"not a font").unwrap();
+
+        let found = discover(std::slice::from_ref(&root));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let faces: Vec<&str> = found.iter().map(|f| f.face.as_str()).collect();
+        assert_eq!(found.len(), 3, "{faces:?}");
+        assert!(faces.contains(&"UnlicensedFace-Regular"), "{faces:?}");
+        assert!(faces.contains(&"PropAdobe-Regular"), "{faces:?}");
+        assert!(faces.contains(&"SourceHanSans-Regular"), "{faces:?}");
     }
 }

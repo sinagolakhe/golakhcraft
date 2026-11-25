@@ -81,6 +81,32 @@ fn opentype_cff_document_font_preserves_program_codes_and_rendering_after_reopen
     exercise(support::font_fixture::cff_font(), "A A", "RectFont-Regular");
 }
 #[test]
+fn unlicensed_and_proprietary_document_fonts_register_and_render_via_session() {
+    let unlicensed = support::font_fixture::cff_font_with_names(&[(1, "Unlicensed Rect"), (2, "Regular"), (6, "UnlicensedRect-Regular")]);
+    exercise(unlicensed, "A A", "UnlicensedRect-Regular");
+
+    let mut s = Session::new();
+    let id = s.open("source.pdf", None, document(), None).unwrap();
+    let proprietary = support::font_fixture::cff_font_with_names(&[
+        (0, "Copyright 2026 Adobe"),
+        (1, "Prop Rect"),
+        (2, "Regular"),
+        (6, "PropRect-Regular"),
+        (8, "Adobe"),
+        (13, "Proprietary License"),
+    ]);
+    s.apply(id, Edit::RegisterTextFont { page: 0, bytes: Arc::new(proprietary) }).unwrap();
+
+    let noto_cjk = support::font_fixture::cff_font_with_names(&[(1, "Noto Sans CJK JP"), (2, "Regular"), (6, "NotoSansCJKjp-Regular")]);
+    s.apply(id, Edit::RegisterTextFont { page: 0, bytes: Arc::new(noto_cjk) }).unwrap();
+
+    let source_han = support::font_fixture::cff_font_with_names(&[(1, "Source Han Sans"), (2, "Regular"), (6, "SourceHanSans-Regular")]);
+    s.apply(id, Edit::RegisterTextFont { page: 0, bytes: Arc::new(source_han) }).unwrap();
+
+    let err = s.apply(id, Edit::RegisterTextFont { page: 0, bytes: Arc::new(b"not a font".to_vec()) }).unwrap_err().to_string();
+    assert!(!err.contains("select an openly licensed font") && !err.contains("openly licensed") && !err.contains("asset policy"), "{err}");
+}
+#[test]
 fn contextual_arabic_marks_ligatures_and_mixed_bidi_keep_logical_text_after_reopen() {
     if let Some(path) = std::env::var_os("PDFCRAFT_TEST_ARABIC_FONT") {
         exercise(std::fs::read(path).unwrap(), "سَلَام 123", "NotoSansArabic-Regular");
@@ -91,7 +117,7 @@ fn contextual_arabic_marks_ligatures_and_mixed_bidi_keep_logical_text_after_reop
         return;
     };
     if pdfcraft_fonts::embedding::validate(font.bytes).is_err() {
-        eprintln!("set PDFCRAFT_TEST_ARABIC_FONT to an openly licensed static Noto Sans Arabic face");
+        eprintln!("set PDFCRAFT_TEST_ARABIC_FONT to a static Noto Sans Arabic face");
         return;
     }
     exercise(font.bytes.to_vec(), "سَلَام 123", "NotoSansArabic-Regular");

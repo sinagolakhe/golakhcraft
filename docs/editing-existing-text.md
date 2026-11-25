@@ -41,7 +41,7 @@ multi-row paragraphs retain their existing wrap width. Retyping uses a preview w
 that added item's old drawing removed, so deleted draft characters do not show underneath.
 
 A subset font contains only some of the original face's glyphs. A new character cannot be
-reconstructed from a glyph the PDF does not contain. **Load font…** imports an openly licensed,
+reconstructed from a glyph the PDF does not contain. **Load font…** imports an
 embeddable standalone `.ttf` or `.otf` face. **Installed fonts…** discovers eligible user-installed
 faces on request, off the UI thread; the document-font menu selects resources already on the
 page. Select **Keep source fonts** to preserve each run's original face. A matching full face
@@ -53,8 +53,7 @@ without a craft-fonts build says so. Replacement text takes the craft-fonts Japa
 they can draw all of it, and the bundled Inter face (`assets/fonts`) for the Latin, Greek and
 Cyrillic letters they lack (Uzbek `қизил`, Kazakh `әже`): that face needs no build input, so
 these work in every build, the web one included. Choosing another face
-is explicit. Fonts with restricted embedding, unsupported collections, excluded families or
-no open-licence declaration are refused. Interface fallback fonts are never exported.
+is explicit. Fonts with restricted embedding or unsupported collections are refused. Interface fallback fonts are never exported.
 
 The full selected program, glyph mappings, widths and Unicode text are embedded in the PDF.
 Saving and reopening therefore needs no locally installed font. Editing the same text again

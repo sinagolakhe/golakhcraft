@@ -9518,6 +9518,102 @@ fn a_shaped_run_is_one_text_object_with_each_glyph_where_shaping_put_it() {
     assert_eq!(rise, 0.0, "the rise is reset after the run");
 }
 
+fn replace_sfnt_name_table(sfnt: &[u8], records: &[(u16, &str)]) -> Vec<u8> {
+    let mut sorted = records.to_vec();
+    sorted.sort_by_key(|&(id, _)| id);
+    let mut name = Vec::new();
+    name.extend_from_slice(&0u16.to_be_bytes());
+    name.extend_from_slice(&(sorted.len() as u16).to_be_bytes());
+    name.extend_from_slice(&((6 + 12 * sorted.len()) as u16).to_be_bytes());
+    let mut strings = Vec::new();
+    for (id, text) in sorted {
+        let encoded: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        for field in [3u16, 1, 0x0409, id, encoded.len() as u16, strings.len() as u16] {
+            name.extend_from_slice(&field.to_be_bytes());
+        }
+        strings.extend_from_slice(&encoded);
+    }
+    name.extend_from_slice(&strings);
+
+    let num_tables = u16::from_be_bytes([sfnt[4], sfnt[5]]) as usize;
+    let mut tables: Vec<([u8; 4], Vec<u8>)> = (0..num_tables)
+        .filter_map(|i| {
+            let rec = 12 + i * 16;
+            let tag: [u8; 4] = sfnt[rec..rec + 4].try_into().unwrap();
+            if &tag == b"name" {
+                return None;
+            }
+            let offset = u32::from_be_bytes(sfnt[rec + 8..rec + 12].try_into().unwrap()) as usize;
+            let len = u32::from_be_bytes(sfnt[rec + 12..rec + 16].try_into().unwrap()) as usize;
+            Some((tag, sfnt[offset..offset + len].to_vec()))
+        })
+        .collect();
+    tables.push((*b"name", name));
+    tables.sort_by_key(|(tag, _)| *tag);
+
+    let count = tables.len() as u16;
+    let selector = count.ilog2() as u16;
+    let search_range = (1u16 << selector) * 16;
+    let mut out = Vec::new();
+    out.extend_from_slice(&sfnt[0..4]);
+    out.extend_from_slice(&count.to_be_bytes());
+    out.extend_from_slice(&search_range.to_be_bytes());
+    out.extend_from_slice(&selector.to_be_bytes());
+    out.extend_from_slice(&(count * 16 - search_range).to_be_bytes());
+
+    let mut offset = 12 + 16 * tables.len();
+    let mut payload = Vec::new();
+    for (tag, bytes) in &tables {
+        let mut padded = bytes.clone();
+        padded.resize(padded.len().next_multiple_of(4), 0);
+        let sum = padded.as_chunks::<4>().0.iter().fold(0u32, |s, b| s.wrapping_add(u32::from_be_bytes(*b)));
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&sum.to_be_bytes());
+        out.extend_from_slice(&(offset as u32).to_be_bytes());
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        offset += padded.len();
+        payload.extend_from_slice(&padded);
+    }
+    out.extend_from_slice(&payload);
+    out
+}
+
+#[test]
+fn register_text_font_accepts_unlicensed_proprietary_adobe_and_cjk_fonts() {
+    let inter = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+
+    let unlicensed = replace_sfnt_name_table(inter, &[(1, "Unlicensed Sans"), (2, "Regular"), (6, "UnlicensedSans-Regular")]);
+    let resource = text::register_text_font(&mut doc, 0, &unlicensed).unwrap();
+    let style = text::BlockStyle { width: Some(400.0), resource: Some(resource), ..Default::default() };
+    text::rewrite_block(&mut doc, 0, 0, Some("Custom unlicensed text"), &style).unwrap();
+    assert_eq!(text::text_blocks(&reopen(&doc), 0).unwrap()[0].editor_text, "Custom unlicensed text");
+
+    let prop_adobe = replace_sfnt_name_table(
+        inter,
+        &[
+            (0, "Copyright 2026 Adobe"),
+            (1, "Adobe Prop"),
+            (2, "Regular"),
+            (6, "AdobeProp-Regular"),
+            (8, "Adobe"),
+            (13, "Proprietary - All Rights Reserved"),
+        ],
+    );
+    assert!(text::register_text_font(&mut doc, 0, &prop_adobe).is_ok());
+
+    let cjk = replace_sfnt_name_table(inter, &[(1, "Source Han Sans"), (2, "Regular"), (6, "SourceHanSans-Regular")]);
+    assert!(text::register_text_font(&mut doc, 0, &cjk).is_ok());
+
+    let mut restricted = unlicensed;
+    let fs_type = sfnt_table(&restricted, b"OS/2") + 8;
+    restricted[fs_type..fs_type + 2].copy_from_slice(&2u16.to_be_bytes());
+    let Err(EditError::Invalid(msg)) = text::register_text_font(&mut doc, 0, &restricted) else {
+        panic!("expected restricted embedding error");
+    };
+    assert!(msg.contains("prohibit editable outline embedding") && !msg.contains("openly licensed") && !msg.contains("licence"), "{msg}");
+}
+
 #[test]
 fn a_subset_program_is_not_trusted_for_new_characters_and_the_error_names_the_character() {
     let mut doc = embedded_program_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET", "ABCDEF+Inter-Regular");

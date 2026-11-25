@@ -183,7 +183,7 @@ pub(crate) fn panel(
                         let reload = ui.button(tl!("Reload")).clicked();
                         match crate::files::installed_font_files(ui.ctx(), reload) {
                             Some(list) if list.is_empty() => {
-                                ui.label(tl!("No openly licensed document fonts found. Load a font file."));
+                                ui.label(tl!("No document fonts found. Load a font file."));
                             }
                             Some(list) => {
                                 let search_id = ui.scope_id().with("installed-font-search");
@@ -213,7 +213,7 @@ pub(crate) fn panel(
                                 }
 
                                 if families.is_empty() {
-                                    ui.label(tl!("No openly licensed document fonts found. Load a font file."));
+                                    ui.label(tl!("No document fonts found. Load a font file."));
                                 } else {
                                     egui::ScrollArea::vertical().max_height(350.0).show(ui, |ui| {
                                         for (family, faces) in families {

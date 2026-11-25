@@ -48,48 +48,10 @@ pub fn names(bytes: &[u8]) -> Result<(String, String), String> {
     Ok((family, postscript))
 }
 
-/// A selected external font is document input. Require its own open-licence declaration;
-/// never turn a proprietary system-interface fallback into an exported PDF font.
+/// Validate a selected external document font: require a standalone, embeddable
+/// TrueType/OpenType face with a valid family name, without checking its licence metadata.
 pub fn validate_document_input(bytes: &[u8]) -> Result<(), String> {
-    use skrifa::string::StringId;
-    let (family, _) = names(bytes)?;
-    let key = face_key(&family);
-    if ["sourcehan", "sourceserif", "sourcesans", "notosanscjk", "notoserifcjk"].iter().any(|n| key.starts_with(n)) {
-        return Err("this font family is excluded by the project's asset policy".into());
-    }
-    let f = FontRef::new(bytes).map_err(|e| e.to_string())?;
-    // An Adobe scan that could not finish fails closed, like a match.
-    if any_name_record(&f, &[StringId::COPYRIGHT_NOTICE, StringId::MANUFACTURER], |t| t.to_ascii_lowercase().contains("adobe")) != Some(false) {
-        return Err("Adobe-authored font assets are excluded by the project's asset policy".into());
-    }
-    let licences = ["SIL OPEN FONT", "SIL Open Font", "Apache License", "Ubuntu Font Licence", "Bitstream Vera", "MIT License"];
-    if any_name_record(&f, &[StringId::LICENSE_DESCRIPTION], |t| licences.iter().any(|l| t.contains(l))) != Some(true) {
-        return Err("select an openly licensed font whose name table declares its licence (OFL, Apache, Ubuntu, Bitstream Vera or MIT)".into());
-    }
-    Ok(())
-}
-
-/// Name-table text one policy check reads in all.
-const MAX_NAME_BYTES: usize = 1 << 20;
-
-/// Whether `found` holds for any record of the name-table strings `ids`, read one at a time
-/// within [`MAX_NAME_BYTES`] in all: `Some(true)` for a match, `Some(false)` when every record was
-/// read and none matched, `None` when the allowance ran out first (a record that does not fit what
-/// is left is not searched). The table can point many records at one large string, so the records
-/// are never joined.
-fn any_name_record(font: &FontRef, ids: &[skrifa::string::StringId], found: impl Fn(&str) -> bool) -> Option<bool> {
-    let mut left = MAX_NAME_BYTES;
-    for s in ids.iter().flat_map(|id| font.localized_strings(*id)) {
-        let text = s.to_string();
-        if text.len() > left {
-            return None;
-        }
-        left -= text.len().max(1).min(left);
-        if found(&text) {
-            return Some(true);
-        }
-    }
-    Some(false)
+    names(bytes).map(|_| ())
 }
 
 /// Validate before allocating any PDF objects, so an invalid font cannot partly mutate a doc.
@@ -343,15 +305,101 @@ mod tests {
         assert_eq!(face_key("ABCDEF+Droid-Sans-Fallback"), face_key("Droid Sans Fallback"));
     }
 
+    fn replace_name_table(sfnt: &[u8], records: &[(u16, &str)]) -> Vec<u8> {
+        let mut sorted = records.to_vec();
+        sorted.sort_by_key(|&(id, _)| id);
+        let mut name = Vec::new();
+        name.extend_from_slice(&0u16.to_be_bytes());
+        name.extend_from_slice(&(sorted.len() as u16).to_be_bytes());
+        name.extend_from_slice(&((6 + 12 * sorted.len()) as u16).to_be_bytes());
+        let mut strings = Vec::new();
+        for (id, text) in sorted {
+            let encoded: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+            for field in [3u16, 1, 0x0409, id, encoded.len() as u16, strings.len() as u16] {
+                name.extend_from_slice(&field.to_be_bytes());
+            }
+            strings.extend_from_slice(&encoded);
+        }
+        name.extend_from_slice(&strings);
+
+        let num_tables = u16::from_be_bytes([sfnt[4], sfnt[5]]) as usize;
+        let mut tables: Vec<([u8; 4], Vec<u8>)> = (0..num_tables)
+            .filter_map(|i| {
+                let rec = 12 + i * 16;
+                let tag: [u8; 4] = sfnt[rec..rec + 4].try_into().unwrap();
+                if &tag == b"name" {
+                    return None;
+                }
+                let offset = u32::from_be_bytes(sfnt[rec + 8..rec + 12].try_into().unwrap()) as usize;
+                let len = u32::from_be_bytes(sfnt[rec + 12..rec + 16].try_into().unwrap()) as usize;
+                Some((tag, sfnt[offset..offset + len].to_vec()))
+            })
+            .collect();
+        tables.push((*b"name", name));
+        tables.sort_by_key(|(tag, _)| *tag);
+
+        let count = tables.len() as u16;
+        let selector = count.ilog2() as u16;
+        let search_range = (1u16 << selector) * 16;
+        let mut out = Vec::new();
+        out.extend_from_slice(&sfnt[0..4]);
+        out.extend_from_slice(&count.to_be_bytes());
+        out.extend_from_slice(&search_range.to_be_bytes());
+        out.extend_from_slice(&selector.to_be_bytes());
+        out.extend_from_slice(&(count * 16 - search_range).to_be_bytes());
+
+        let mut offset = 12 + 16 * tables.len();
+        let mut payload = Vec::new();
+        for (tag, bytes) in &tables {
+            let mut padded = bytes.clone();
+            padded.resize(padded.len().next_multiple_of(4), 0);
+            let sum = padded.as_chunks::<4>().0.iter().fold(0u32, |s, b| s.wrapping_add(u32::from_be_bytes(*b)));
+            out.extend_from_slice(tag);
+            out.extend_from_slice(&sum.to_be_bytes());
+            out.extend_from_slice(&(offset as u32).to_be_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            offset += padded.len();
+            payload.extend_from_slice(&padded);
+        }
+        out.extend_from_slice(&payload);
+        out
+    }
+
     #[test]
-    fn licence_policy_reads_name_records_one_at_a_time() {
-        use skrifa::string::StringId;
+    fn document_input_accepts_any_valid_font_without_licence_checks() {
         let bytes = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
         assert!(validate_document_input(bytes).is_ok(), "an OFL font passes");
-        let face = FontRef::new(bytes).unwrap();
-        assert_eq!(any_name_record(&face, &[StringId::LICENSE_DESCRIPTION], |t| t.contains("SIL Open Font")), Some(true));
-        assert_eq!(any_name_record(&face, &[StringId::LICENSE_DESCRIPTION], |_| false), Some(false));
-        assert_eq!(any_name_record(&face, &[], |_| true), Some(false), "no ids, no records");
+
+        let unlicensed = replace_name_table(bytes, &[(1, "Unlicensed Sans"), (2, "Regular"), (6, "UnlicensedSans-Regular")]);
+        assert!(validate_document_input(&unlicensed).is_ok(), "a font without LICENSE_DESCRIPTION passes");
+
+        let proprietary_adobe = replace_name_table(
+            bytes,
+            &[
+                (0, "Copyright 2026 Adobe"),
+                (1, "Proprietary Sans"),
+                (2, "Regular"),
+                (6, "ProprietarySans-Regular"),
+                (8, "Adobe"),
+                (13, "Proprietary Commercial License"),
+            ],
+        );
+        assert!(validate_document_input(&proprietary_adobe).is_ok(), "Adobe and proprietary fonts pass");
+
+        let noto_cjk = replace_name_table(bytes, &[(1, "Noto Sans CJK JP"), (2, "Regular"), (6, "NotoSansCJKjp-Regular")]);
+        assert!(validate_document_input(&noto_cjk).is_ok(), "NotoSansCJK without license passes");
+
+        let source_han = replace_name_table(bytes, &[(1, "Source Han Sans"), (2, "Regular"), (6, "SourceHanSans-Regular")]);
+        assert!(validate_document_input(&source_han).is_ok(), "SourceHanSans without license passes");
+
+        let mut doc = Document::new_empty();
+        let mut fonts = Dict::new();
+        assert!(embed(&mut doc, &mut fonts, &unlicensed, "UnlicensedSans-Regular").is_ok());
+
+        let no_family = replace_name_table(bytes, &[]);
+        assert_eq!(validate_document_input(&no_family).unwrap_err(), "the font has no family name");
+        let err = validate_document_input(b"not a font").unwrap_err();
+        assert!(!err.contains("openly licensed") && !err.contains("licence"), "{err}");
     }
 
     #[test]
